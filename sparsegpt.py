@@ -29,21 +29,41 @@ class SparseGPT:
         self.H = torch.zeros((self.columns, self.columns), device=self.dev)
         self.nsamples = 0
 
-    def add_batch(self, inp, out, blocksize=1024):
-        if DEBUG:
-            self.inp1 = inp
-            self.out1 = out
+    def add_batch(self, inp, out):
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
         tmp = inp.shape[0]
-        if isinstance(self.layer, nn.Linear) or isinstance(self.layer, transformers.Conv1D):
-            if len(inp.shape) == 3:
-                inp = inp.reshape((-1, inp.shape[-1]))
-            inp = inp.t()
-        self.H *= self.nsamples / (self.nsamples + tmp)
+        
+        # Reshape to (Tokens, Features)
+        if len(inp.shape) == 3:
+            inp = inp.reshape((-1, inp.shape[-1]))
+        inp = inp.t() # Now (Features, Tokens)
+
+        # 1. Update Sample Count
+        old_nsamples = self.nsamples
         self.nsamples += tmp
-        inp = math.sqrt(2 / self.nsamples) * inp.float()
-        self.H += inp.matmul(inp.t())
+        
+        # 2. Scaling Factor (EMA style to keep H stable)
+        # We do this on CPU or in-place to save VRAM
+        self.H *= (old_nsamples / self.nsamples)
+        
+        # 3. CHUNKED ACCUMULATION (The OOM Fix)
+        # Instead of one big matmul, we do smaller ones
+        count = inp.shape[1] # Number of tokens
+        chunk_size = 512    # Adjust this if you still OOM
+        
+        # Pre-scale inp to avoid doing it inside the loop
+        inp = inp.float() * math.sqrt(2 / self.nsamples)
+        
+        for i in range(0, count, chunk_size):
+            end = min(i + chunk_size, count)
+            chunk = inp[:, i:end]
+            # This update is much safer for the GPU memory manager
+            self.H += chunk.matmul(chunk.t())
+            
+        # Free up memory immediately
+        del inp, chunk
+        torch.cuda.empty_cache()
 
     def fasterprune(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01
