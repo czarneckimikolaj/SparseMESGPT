@@ -1,4 +1,4 @@
-from .election_model import Election, Candidate, Voter
+from election_model import Election, Candidate, Voter
 import math
 
 
@@ -271,7 +271,7 @@ def equal_shares(e : Election, completion : str = None) -> set[Candidate]:
         * 'eps',
         * None."""
 
-
+from tqdm import tqdm
 
 def bounded_overspending(e : Election, real_budget : int = 0) -> (set[Candidate]):
     W = set()
@@ -279,6 +279,9 @@ def bounded_overspending(e : Election, real_budget : int = 0) -> (set[Candidate]
     remaining = set(c for c in e.profile)
     endow = {i : 1.0 * e.budget / len(e.voters) for i in e.voters}
     ratio = {c : -1.0 for c in e.profile}
+
+    pbar = tqdm(total=e.budget)
+
     while True:
         next_candidate = None
         lowest_ratio = float("inf")
@@ -322,11 +325,16 @@ def bounded_overspending(e : Election, real_budget : int = 0) -> (set[Candidate]
             W.add(next_candidate)
             costW += next_candidate.cost
             remaining.remove(next_candidate)
+
+            pbar.update(1)
+
             for i in e.profile[next_candidate]:
                 endow[i] -= min(endow[i], lowest_rho * e.profile[next_candidate][i])
             if real_budget: #optimization for 'increase-budget' completions
                 if costW > real_budget:
+                    pbar.close()
                     return None
+    pbar.close()
     return W
 
 

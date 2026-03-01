@@ -1,8 +1,13 @@
 import torch
 import torch.nn as nn
 
-
-DEV = torch.device('cuda:0')
+# Check for Apple Silicon GPU
+if torch.backends.mps.is_available():
+    DEV = torch.device("mps")
+elif torch.cuda.is_available():
+    DEV = torch.device("cuda")
+else:
+    DEV = torch.device("cpu")
 
 
 def find_layers(module, layers=[nn.Conv2d, nn.Linear], name=''):

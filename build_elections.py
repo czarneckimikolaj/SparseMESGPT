@@ -1,5 +1,5 @@
 import torch
-from .election_model import Voter, Candidate, Election
+from election_model import Voter, Candidate, Election
 
 def tensor_to_voter(id: str, utility_tensor, candidates, candidate_dict):
     # print(f"Voter {id} processed")

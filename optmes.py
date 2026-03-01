@@ -4,9 +4,9 @@ import torch
 import torch.nn as nn
 
 from quant import *
-from sparsegpt import *
+# from sparsegpt import *
 from modelutils import *
-# from sparsemesgpt import *
+from sparsemesgpt import *
 
 try:
     import wandb
@@ -80,6 +80,7 @@ def opt_sequential(model, dataloader, dev):
 
     print('Ready.')
 
+    print("Total Layers:", len(layers))
     for i in range(len(layers)):
         layer = layers[i].to(dev)
 
@@ -89,7 +90,7 @@ def opt_sequential(model, dataloader, dev):
         for name in subset:
             if (not (args.minlayer <= i < args.maxlayer and args.prune_only in name)) == (not args.invert):
               continue
-            gpts[name] = SparseGPT(subset[name])
+            gpts[name] = SparseMESGPT(subset[name])
             if args.wbits < 16:
                 gpts[name].quantizer = Quantizer()
                 gpts[name].quantizer.configure(
@@ -113,7 +114,7 @@ def opt_sequential(model, dataloader, dev):
             print('Pruning ...')
             sparsity = args.sparsity
             gpts[name].fasterprune(
-                sparsity, prunen=args.prunen, prunem=args.prunem, percdamp=args.percdamp, blocksize=args.blocksize
+                sparsity, percdamp=args.percdamp, blocksize=args.blocksize
             )
             gpts[name].free()
 
@@ -201,7 +202,7 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
         del layer
         torch.cuda.empty_cache()
         inps, outs = outs, inps
-        
+
         elapsed = time.time() - start_time
         print(f"Done in {elapsed:.2f} seconds")
 
