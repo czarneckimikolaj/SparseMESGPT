@@ -6,7 +6,7 @@ import torch.nn as nn
 from quant import *
 # from sparsegpt import *
 from modelutils import *
-from sparsemesgpt import *
+from sparserandomgpt import *
 
 try:
     import wandb
@@ -23,7 +23,7 @@ def get_opt(model):
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     from transformers import OPTForCausalLM
-    model = OPTForCausalLM.from_pretrained(model, torch_dtype=torch.float32)
+    model = OPTForCausalLM.from_pretrained(model, torch_dtype='auto')
     model.seqlen = model.config.max_position_embeddings
     return model
 
@@ -73,10 +73,7 @@ def opt_sequential(model, dataloader, dev):
         model.model.decoder.project_out = model.model.decoder.project_out.cpu()
     if hasattr(model.model.decoder, 'project_in') and model.model.decoder.project_in:
         model.model.decoder.project_in = model.model.decoder.project_in.cpu()
-    if torch.backends.mps.is_available():
-        torch.mps.empty_cache()
-    else:
-        torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
@@ -93,7 +90,7 @@ def opt_sequential(model, dataloader, dev):
         for name in subset:
             if (not (args.minlayer <= i < args.maxlayer and args.prune_only in name)) == (not args.invert):
               continue
-            gpts[name] = SparseMESGPT(subset[name])
+            gpts[name] = SparseRandomGPT(subset[name])
             if args.wbits < 16:
                 gpts[name].quantizer = Quantizer()
                 gpts[name].quantizer.configure(
@@ -126,10 +123,7 @@ def opt_sequential(model, dataloader, dev):
 
         layers[i] = layer.cpu()
         del layer
-        if torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-        else:
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
 
         inps, outs = outs, inps
 
@@ -185,11 +179,7 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
         model.model.decoder.project_out = model.model.decoder.project_out.cpu()
     if hasattr(model.model.decoder, 'project_in') and model.model.decoder.project_in:
         model.model.decoder.project_in = model.model.decoder.project_in.cpu()
-    
-    if torch.backends.mps.is_available():
-        torch.mps.empty_cache()
-    else:
-        torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
@@ -210,12 +200,7 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
         layers[i] = layer.cpu()
         del layer
-        
-        if torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-        else:
-            torch.cuda.empty_cache()
-
+        torch.cuda.empty_cache()
         inps, outs = outs, inps
 
         elapsed = time.time() - start_time

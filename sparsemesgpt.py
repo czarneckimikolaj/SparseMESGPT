@@ -69,9 +69,6 @@ torch.backends.cudnn.allow_tf32 = False
 import torch
 
 def make_election_lazy_optimized(W1, voter_diags, sparsity, epsilon=1e-6, batch_size=512):
-    # W1 shape: (num_rows, num_cols) -> Flattened candidates
-    # voter_diags shape: (num_voters, 1) or (num_voters, 128)
-    
     num_voters = voter_diags.shape[0]
     num_rows, num_cols = W1.shape
     total_votes = num_rows * num_cols
@@ -80,58 +77,62 @@ def make_election_lazy_optimized(W1, voter_diags, sparsity, epsilon=1e-6, batch_
     voters = [Voter(id=i) for i in range(num_voters)]
     profile = {candidate: {} for candidate in candidates}
     
-    # 1. Precompute flat W1 and d_vals
-    W1_flat_sq = (W1.view(-1) ** 2)
+    # 1. Precompute Squared Values
+    # W1_sq shape: (num_rows, num_cols)
+    W1_sq = W1 ** 2
     
-    d_vals_all = voter_diags.view(num_voters, -1)[:, 0:1] ** 2
+    # d_vals_all shape: (num_voters, num_cols)
+    d_vals_all = voter_diags ** 2
     d_vals_all = torch.clamp(d_vals_all, min=1e-12)
     
-    # 2. Process in chunks to prevent OOM
     print(f"Processing {num_voters} voters in batches of {batch_size}...")
     for start_idx in range(0, num_voters, batch_size):
         end_idx = min(start_idx + batch_size, num_voters)
         
-        # Slice d_vals for the current batch
+        # Shape: (batch_size, num_cols)
         d_vals_batch = d_vals_all[start_idx:end_idx]
         
-        # Broadcast division for just this batch
-        matrix_batch = W1_flat_sq.unsqueeze(0) / d_vals_batch
+        # 2. Proper Broadcasting
+        # W1_sq.unsqueeze(0)        -> (1, num_rows, num_cols)
+        # d_vals_batch.unsqueeze(1) -> (batch_size, 1, num_cols)
+        # Result matrix_batch       -> (batch_size, num_rows, num_cols)
+        matrix_batch = W1_sq.unsqueeze(0) / d_vals_batch.unsqueeze(1)
         
-        # Row-wise sums and in-place division to save memory
+        # Flatten the row/col dimensions to match candidate IDs
+        # New shape: (batch_size, num_rows * num_cols)
+        matrix_batch = matrix_batch.view(d_vals_batch.size(0), -1)
+        
+        # 3. Row-wise sums and in-place division (Softmax-ish normalization)
         v_sums = matrix_batch.sum(dim=1, keepdim=True)
         v_sums = torch.clamp(v_sums, min=1e-12)
-        matrix_batch.div_(v_sums)  # div_() modifies matrix_batch in-place!
+        matrix_batch.div_(v_sums)
         
-        # 3. Vectorize the Pruning for the batch
+        # 4. Vectorize the Pruning for the batch
         mask = matrix_batch > epsilon
         v_idx_local, c_idx = mask.nonzero(as_tuple=True)
         
         if len(v_idx_local) == 0:
-            continue  # Skip if nothing survived pruning
+            continue
             
-        # Shift local batch indices to global voter indices
         v_idx_global = v_idx_local + start_idx
         
-        # 4. Transfer to CPU and convert to list (now much smaller)
+        # 5. Transfer to CPU and populate dict
         vals_list = matrix_batch[v_idx_local, c_idx].cpu().tolist()
         v_idx_list = v_idx_global.cpu().tolist()
         c_idx_list = c_idx.cpu().tolist()
         
-        # 5. Populate the dictionary
         for v_idx, c_idx, val in zip(v_idx_list, c_idx_list, vals_list):
             profile[candidates[c_idx]][voters[v_idx]] = val
             
-        # Clean up batch memory explicitly
         del matrix_batch, mask, v_idx_local, c_idx, v_idx_global
     
-    # Optional: Clear the MPS memory cache after the heavy lifting
     if torch.backends.mps.is_available():
         torch.mps.empty_cache()
 
     budget = int(total_votes * (1 - sparsity))
     nonempty_dict_count = sum(1 for v in profile.values() if v)
     
-    print(f"Election built with {len(profile)} candidates and {num_voters} voters, budget {budget} - {nonempty_dict_count} candidates with supporters.")
+    print(f"Election built: {budget} budget, {nonempty_dict_count} candidates with supporters.")
     
     return Election(
         name="Pruning Election",
@@ -183,6 +184,8 @@ class SparseMESGPT:
         elif len(inp.shape) == 2 and not (isinstance(self.layer, nn.Linear) or isinstance(self.layer, transformers.Conv1D)):
             inp = inp.unsqueeze(0)
 
+        inp = inp.float()
+
         # 1. Global H update (Vectorized Matmul)
         # This replaces the iterative self.H_global update.
         # inp.t() @ inp is mathematically equivalent to sum(x @ x.t() for x in batch)
@@ -215,7 +218,7 @@ class SparseMESGPT:
         if isinstance(self.layer, transformers.Conv1D): W = W.t()
         W = W.float()
 
-        H = self.H_global
+        H = self.H_global.float()
         del self.H_global
         
         # --- NEW: Sanitize the Hessian ---

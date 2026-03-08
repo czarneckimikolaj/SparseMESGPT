@@ -4,7 +4,10 @@ import torch.nn as nn
 
 
 def quantize(x, scale, zero, maxq):
-    q = torch.clamp(torch.round(x / scale) + zero, 0, maxq)
+    # Ensure all inputs to the addition/division are the same dtype as x
+    # and force the clamp boundaries to be floats to avoid the mps.select crash
+    q = torch.round(x / scale) + zero
+    q = torch.clamp(q, 0.0, float(maxq)) 
     return scale * (q - zero)
 
 class Quantizer(nn.Module):
