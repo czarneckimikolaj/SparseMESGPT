@@ -1,0 +1,9 @@
+name: sparsemesgpt_env
+channels:
+  - defaults
+dependencies:
+  - python=3.9.15
+  - pytorch=2.2.0
+  - transformers=4.24.0
+  - pyarrow=4.0.1
+prefix: /Users/mikocz/miniconda3/envs/sparsemesgpt_env
