@@ -1,4 +1,5 @@
 import time
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -23,7 +24,7 @@ def get_opt(model):
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     from transformers import OPTForCausalLM
-    model = OPTForCausalLM.from_pretrained(model, torch_dtype='auto')
+    model = OPTForCausalLM.from_pretrained(model, torch_dtype=torch.float32)
     model.seqlen = model.config.max_position_embeddings
     return model
 
@@ -34,7 +35,6 @@ def opt_sequential(model, dataloader, dev):
     use_cache = model.config.use_cache
     model.config.use_cache = False
     layers = model.model.decoder.layers
-
     model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev) 
     model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(dev)
     if hasattr(model.model.decoder, 'project_out') and model.model.decoder.project_out:
@@ -42,13 +42,12 @@ def opt_sequential(model, dataloader, dev):
     if hasattr(model.model.decoder, 'project_in') and model.model.decoder.project_in:
         model.model.decoder.project_in = model.model.decoder.project_in.to(dev) 
     layers[0] = layers[0].to(dev)
-
+    
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros(
         (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
     cache = {'i': 0, 'attention_mask': None}
-
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
@@ -65,7 +64,6 @@ def opt_sequential(model, dataloader, dev):
         except ValueError:
             pass
     layers[0] = layers[0].module
-
     layers[0] = layers[0].cpu()
     model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
     model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
@@ -73,7 +71,11 @@ def opt_sequential(model, dataloader, dev):
         model.model.decoder.project_out = model.model.decoder.project_out.cpu()
     if hasattr(model.model.decoder, 'project_in') and model.model.decoder.project_in:
         model.model.decoder.project_in = model.model.decoder.project_in.cpu()
-    torch.cuda.empty_cache()
+    
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+    else:
+        torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
@@ -104,10 +106,11 @@ def opt_sequential(model, dataloader, dev):
         for name in gpts:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
         for j in range(args.nsamples):
+            # print(f"inps dim: {inps[j].shape}, attention dim: {attention_mask.shape}")
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
         for h in handles:
             h.remove()
-
+        
         for name in gpts:
             print(i, name)
             print('Pruning ...')
@@ -122,7 +125,10 @@ def opt_sequential(model, dataloader, dev):
 
         layers[i] = layer.cpu()
         del layer
-        torch.cuda.empty_cache()
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        else:
+            torch.cuda.empty_cache()
 
         inps, outs = outs, inps
 
@@ -131,6 +137,8 @@ def opt_sequential(model, dataloader, dev):
 @torch.no_grad()
 def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
     print('Evaluating ...')
+    import csv
+    import numpy as np
 
     testenc = testenc.input_ids
     nsamples = testenc.numel() // model.seqlen
@@ -178,13 +186,17 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
         model.model.decoder.project_out = model.model.decoder.project_out.cpu()
     if hasattr(model.model.decoder, 'project_in') and model.model.decoder.project_in:
         model.model.decoder.project_in = model.model.decoder.project_in.cpu()
-    torch.cuda.empty_cache()
+    
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+    else:
+        torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
 
     for i in range(len(layers)):
-        print(i)
+        print(f"Evaluating Layer {i}")
         start_time = time.time()
         layer = layers[i].to(dev)
 
@@ -199,9 +211,14 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
         layers[i] = layer.cpu()
         del layer
-        torch.cuda.empty_cache()
-        inps, outs = outs, inps
         
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        else:
+            torch.cuda.empty_cache()
+
+        inps, outs = outs, inps
+
         elapsed = time.time() - start_time
         print(f"Done in {elapsed:.2f} seconds")
 
@@ -212,27 +229,62 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
     model.lm_head = model.lm_head.to(dev)
 
     testenc = testenc.to(dev)
-    nlls = []
+    
+    # --- MODIFIED: Token-level loss tracking ---
+    # We use reduction='none' to get individual token losses
+    loss_fct = nn.CrossEntropyLoss(reduction='none')
+    all_token_nlls = []
+
     for i in range(nsamples):
         hidden_states = inps[i].unsqueeze(0)
         if model.model.decoder.final_layer_norm is not None:
             hidden_states = model.model.decoder.final_layer_norm(hidden_states)
         if model.model.decoder.project_out is not None:
             hidden_states = model.model.decoder.project_out(hidden_states)
+            
         lm_logits = model.lm_head(hidden_states)
         shift_logits = lm_logits[:, :-1, :].contiguous()
-        shift_labels = testenc[
-            :, (i * model.seqlen):((i + 1) * model.seqlen)
-        ][:, 1:]
-        loss_fct = nn.CrossEntropyLoss()
-        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        neg_log_likelihood = loss.float() * model.seqlen
-        nlls.append(neg_log_likelihood)
-    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
-    print(f"Perplexity: {ppl.item():3f}")
+        shift_labels = testenc[:, (i * model.seqlen):((i + 1) * model.seqlen)][:, 1:]
+        
+        # Calculate loss per token
+        token_losses = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        
+        # Filter out padding tokens (typically represented by -100 in HF standard)
+        valid_mask = shift_labels.view(-1) != -100
+        valid_nlls = token_losses[valid_mask]
+        
+        # Move to CPU immediately to avoid VRAM bloat
+        all_token_nlls.append(valid_nlls.float().cpu())
+
+    # Concatenate all valid token losses into a single 1D tensor
+    all_token_nlls = torch.cat(all_token_nlls)
+    
+    # Recreate the average perplexity exactly as it was mathematically intended
+    ppl = torch.exp(all_token_nlls.mean())
+    print(f"Perplexity: {ppl.item():.3f}")
     if log_wandb:
          wandb.log({f'{dataset}/perplexity': ppl.item()})
 
+    # --- MODIFIED: Export Histogram to CSV ---
+    # We bin from NLL 0.0 to 20.0 (an NLL of 20 is a massive perplexity of ~4.8e8). 
+    # Tokens beyond 20.0 are clamped to the highest bin.
+    nll_numpy = all_token_nlls.clamp(max=20.0).numpy()
+    
+    # Use 2000 bins for high precision (bin width of 0.01 NLL)
+    counts, bin_edges = np.histogram(nll_numpy, bins=2000, range=(0.0, 20.0))
+    
+    now = datetime.now()
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
+
+    csv_filename = f"{dataset}_opt_token_nll_hist-{timestamp}.csv"
+    with open(csv_filename, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["bin_start", "bin_end", "count"])
+        for idx in range(len(counts)):
+            writer.writerow([bin_edges[idx], bin_edges[idx+1], counts[idx]])
+            
+    print(f"Saved token NLL histogram for CDF generation to {csv_filename}")
+    
     model.config.use_cache = use_cache
 
 
@@ -320,11 +372,11 @@ if __name__ == '__main__':
 
     model = get_opt(args.model)
     model.eval()
-
+    print("Getting dataloaders")
     dataloader, testloader = get_loaders(
         args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen
     )
-
+    print("Pruning")
     if (args.sparsity or args.prunen) and not args.gmp:
         tick = time.time()
         opt_sequential(model, dataloader, DEV)
