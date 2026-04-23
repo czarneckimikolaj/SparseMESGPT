@@ -10,6 +10,8 @@ from quant import *
 from election_model import Voter, Candidate, Election
 from rules import bounded_overspending
 
+from tqdm import tqdm
+
 DEBUG = False 
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -68,7 +70,63 @@ torch.backends.cudnn.allow_tf32 = False
 #     )
 import torch
 
-def make_election_lazy_optimized(W1, voter_diags, sparsity, epsilon=1e-6, batch_size=512):
+import torch
+import numpy as np
+
+import numpy as np
+from numba import njit, prange
+
+@njit(parallel=True, fastmath=True)
+def _compute_utility_core(w_sq_flat, d_vals_sq, epsilon, num_voters, num_cands):
+    # Pre-allocate output (CANDIDATES x VOTERS)
+    out = np.zeros((num_cands, num_voters), dtype=np.float32)
+    
+    # Parallelize over voters (the large dimension)
+    for v in prange(num_voters):
+        # 1. Calculate the normalization sum for this voter
+        voter_sum = 0.0
+        d_val = d_vals_sq[v]
+        
+        # Inner loop: Calculate normalization constant
+        for c in range(num_cands):
+            voter_sum += w_sq_flat[c] / d_val
+            
+        # 2. Safety check for division
+        if voter_sum < 1e-12:
+            continue
+            
+        # 3. Fill the matrix for this voter
+        for c in range(num_cands):
+            utility = (w_sq_flat[c] / d_val) / voter_sum
+            # Apply epsilon threshold (pruning)
+            if utility > epsilon:
+                out[c, v] = utility
+            else:
+                out[c, v] = 0.0
+                
+    return out
+
+def make_utility_matrix_numba(W1, voter_diags, epsilon=1e-6):
+    """
+    CPU-only Numba implementation.
+    Input: NumPy arrays or Tensors (converted to numpy)
+    """
+    # Convert to numpy if they are Tensors
+    if hasattr(W1, 'numpy'): W1 = W1.detach().cpu().numpy()
+    if hasattr(voter_diags, 'numpy'): voter_diags = voter_diags.detach().cpu().numpy()
+    
+    # Pre-flatten and square
+    w_sq_flat = (W1**2).flatten().astype(np.float32)
+    d_vals_sq = (voter_diags**2).astype(np.float32)
+    print(d_vals_sq.shape)
+    
+    num_voters = d_vals_sq.shape[0]
+    num_cands = w_sq_flat.shape[0]
+    
+    # Call the JIT-compiled core
+    return _compute_utility_core(w_sq_flat, d_vals_sq, epsilon, num_voters, num_cands)
+
+def make_election_lazy_optimized(W1, voter_diags, sparsity, epsilon=1e-8, batch_size=512):
     num_voters = voter_diags.shape[0]
     num_rows, num_cols = W1.shape
     total_votes = num_rows * num_cols
@@ -78,53 +136,46 @@ def make_election_lazy_optimized(W1, voter_diags, sparsity, epsilon=1e-6, batch_
     profile = {candidate: {} for candidate in candidates}
     
     # 1. Precompute Squared Values
-    # W1_sq shape: (num_rows, num_cols)
     W1_sq = W1 ** 2
-    
-    # d_vals_all shape: (num_voters, num_cols)
     d_vals_all = voter_diags ** 2
     d_vals_all = torch.clamp(d_vals_all, min=1e-12)
     
-    print(f"Processing {num_voters} voters in batches of {batch_size}...")
+    # aprint(f"Processing {num_voters} voters in batches of {batch_size}...")
     for start_idx in range(0, num_voters, batch_size):
         end_idx = min(start_idx + batch_size, num_voters)
         
-        # Shape: (batch_size, num_cols)
         d_vals_batch = d_vals_all[start_idx:end_idx]
         
         # 2. Proper Broadcasting
-        # W1_sq.unsqueeze(0)        -> (1, num_rows, num_cols)
-        # d_vals_batch.unsqueeze(1) -> (batch_size, 1, num_cols)
-        # Result matrix_batch       -> (batch_size, num_rows, num_cols)
         matrix_batch = W1_sq.unsqueeze(0) / d_vals_batch.unsqueeze(1)
-        
-        # Flatten the row/col dimensions to match candidate IDs
-        # New shape: (batch_size, num_rows * num_cols)
         matrix_batch = matrix_batch.view(d_vals_batch.size(0), -1)
         
-        # 3. Row-wise sums and in-place division (Softmax-ish normalization)
-        v_sums = matrix_batch.sum(dim=1, keepdim=True)
-        v_sums = torch.clamp(v_sums, min=1e-12)
-        matrix_batch.div_(v_sums)
-        
         # 4. Vectorize the Pruning for the batch
-        mask = matrix_batch > epsilon
-        v_idx_local, c_idx = mask.nonzero(as_tuple=True)
+        # FIX: Move mask to CPU *before* nonzero to prevent MPS async garbage-read bugs
+        mask_cpu = (matrix_batch > epsilon).cpu()
+        v_idx_local, c_idx = mask_cpu.nonzero(as_tuple=True)
         
         if len(v_idx_local) == 0:
             continue
             
         v_idx_global = v_idx_local + start_idx
         
-        # 5. Transfer to CPU and populate dict
-        vals_list = matrix_batch[v_idx_local, c_idx].cpu().tolist()
-        v_idx_list = v_idx_global.cpu().tolist()
-        c_idx_list = c_idx.cpu().tolist()
+        # 5. Populate dict
+        # Safely index the device tensor using the validated indices mapped back to device
+        v_idx_local_dev = v_idx_local.to(matrix_batch.device)
+        c_idx_dev = c_idx.to(matrix_batch.device)
+        
+        vals_list = matrix_batch[v_idx_local_dev, c_idx_dev].cpu().tolist()
+        
+        # Lists are already on CPU
+        v_idx_list = v_idx_global.tolist() 
+        c_idx_list = c_idx.tolist()
         
         for v_idx, c_idx, val in zip(v_idx_list, c_idx_list, vals_list):
             profile[candidates[c_idx]][voters[v_idx]] = val
             
-        del matrix_batch, mask, v_idx_local, c_idx, v_idx_global
+        del matrix_batch, mask_cpu, v_idx_local, c_idx, v_idx_global
+        del v_idx_local_dev, c_idx_dev
     
     if torch.backends.mps.is_available():
         torch.mps.empty_cache()
@@ -132,7 +183,7 @@ def make_election_lazy_optimized(W1, voter_diags, sparsity, epsilon=1e-6, batch_
     budget = int(total_votes * (1 - sparsity))
     nonempty_dict_count = sum(1 for v in profile.values() if v)
     
-    print(f"Election built: {budget} budget, {nonempty_dict_count} candidates with supporters.")
+    print(f"Election built: {budget} - budget, {nonempty_dict_count} - candidates with supporters, {total_votes} - total candidates ({num_rows} rows x {num_cols} cols).")
     
     return Election(
         name="Pruning Election",
@@ -141,7 +192,7 @@ def make_election_lazy_optimized(W1, voter_diags, sparsity, epsilon=1e-6, batch_
         budget=budget
     )
 
-def results_to_mask(winners, num_rows, num_cols, device):
+def results_to_mask(winners, num_rows, num_cols, device, object_winners=True):
     # 1. Create a flattened mask of "True" (Prune everything by default)
     # In SparseGPT, True usually means "Prune" and False means "Keep"
     # (Check your mask1 logic: mask1 = tmp <= thresh means True is pruned)
@@ -149,10 +200,25 @@ def results_to_mask(winners, num_rows, num_cols, device):
 
     # 2. Set winners to False (Do NOT prune)
     # If your winners are Candidate objects:
-    winner_ids = [c.id for c in winners]
-    
+    if object_winners:
+        winner_ids = [c.id for c in winners]
+    else:
+        winner_ids = [c for c, is_winner in enumerate(winners) if is_winner==1]
+
     # If your winners are just IDs, use them directly
     flattened_mask[winner_ids] = False
+
+    # 3. Reshape back to the 2D block shape (R, C)
+    return flattened_mask.view(num_rows, num_cols)
+
+def results_ndarray_to_mask(winners, num_rows, num_cols, device):
+    # 1. Create a flattened mask of "True" (Prune everything by default)
+    # In SparseGPT, True usually means "Prune" and False means "Keep"
+    # (Check your mask1 logic: mask1 = tmp <= thresh means True is pruned)
+    flattened_mask = torch.ones(num_rows * num_cols, device=device, dtype=torch.bool)
+    
+    # If your winners are just IDs, use them directly
+    flattened_mask[winners] = False
 
     # 3. Reshape back to the 2D block shape (R, C)
     return flattened_mask.view(num_rows, num_cols)
@@ -281,37 +347,70 @@ class SparseMESGPT:
         # Convert H_diags list to a single tensor for vectorized scoring
         # Shape: (num_samples, columns)
         print(f"Preparing voter diagonals, {self.H_diags.__len__()} samples collected...")
+        print(f"H_diags elt shape {self.H_diags[0].shape}")
         voter_diags = torch.stack(self.H_diags) 
+        print(f"voter diags shape {voter_diags.shape}")
 
+        pbar = tqdm(total=math.floor(self.columns / blocksize))
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
 
             W1 = W[:, i1:i2].clone()
+
             Hinv_global1 = Hinv_global[i1:i2, i1:i2]
             
             # --- 2. THE ELECTION (SCORING) ---
             # Get voter diagonals for this specific block: (num_samples, blocksize)
             voter_diags1 = voter_diags[:, i1:i2] 
+            # print(f"voter diags 1 shape {voter_diags1.shape}")
             
             # Compute scores for ALL voters simultaneously
             # Using broadcasting: (rows, blocksize) / (num_samples, 1, blocksize)
             # Result utility_tensor shape: (num_samples, rows, blocksize)
-            print(f"W1 shape: {W1.shape}, voter_diags1 shape: {voter_diags1.shape}")
-            # utility_tensor = (W1.unsqueeze(0) ** 2) / (voter_diags1.unsqueeze(1) ** 2)
+            rows = W1.shape[0]
+            voters = voter_diags1.shape[0]
+            # print(f"W1 shape: {W1.shape}, voter_diags1 shape: {voter_diags1.shape}")
 
             # YOUR ELECTION LOGIC HERE:
+
+            # NUMBA ELECTION
+            # start_time = time.time()
+            # utility_3d = (W1.unsqueeze(0)**2) / (voter_diags1.unsqueeze(1)**2)
+            # utility = utility_3d.view(voters, rows * count).t()
+            # utility = np.array(utility.cpu())
+          
+            # utility = utility.T
+            # num_candidates, num_voters = utility.shape
+            
+            # costs = np.ones(num_candidates)
+            # budgets = int(sparsity * num_candidates)
+            # make_election_time = time.time() - start_time
+
+            # start_time = time.time()
+
+            # winners = bounded_overspending_numba(utility, costs, budgets)
+            # run_election_time = time.time() - start_time
+
+
+            # mask1 = results_to_mask(winners, W1.shape[0], W1.shape[1], self.dev, object_winners=False)
+
+            # ------------------
+
+            # OOP ELECTION
             start_time = time.time()
             election = make_election_lazy_optimized(W1, voter_diags1, sparsity)
+ 
             make_election_time = time.time() - start_time
 
             start_time = time.time()
             winners = bounded_overspending(election)
             run_election_time = time.time() - start_time
 
-            print(f"Election prepared in {make_election_time:.2f} seconds, run in {run_election_time:.2f} seconds, selected {len(winners)} winners out of {len(election.profile)}.")
+            print(f"Election prepared in {make_election_time:.2f} seconds, run in {run_election_time:.2f} seconds, selected {len(winners)} winners.")
 
             mask1 = results_to_mask(winners, W1.shape[0], W1.shape[1], self.dev)
+            # -------------------
 
             # --- 3. PRUNE & COMPENSATE ---
             Q1 = torch.zeros_like(W1)
@@ -339,7 +438,9 @@ class SparseMESGPT:
             # Global update for the rest of the matrix
             W[:, i1:i2] = Q1
             W[:, i2:] -= Err1.matmul(Hinv_global[i1:i2, i2:])
-
+            pbar.update(1)
+        
+        pbar.close()
         # Finalize layer weights
         if isinstance(self.layer, transformers.Conv1D): W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)

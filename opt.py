@@ -276,7 +276,7 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
     now = datetime.now()
     timestamp = now.strftime("%Y%m%d_%H%M%S")
 
-    csv_filename = f"{dataset}_opt_token_nll_hist-{timestamp}.csv"
+    csv_filename = f"data/{dataset}_opt_token_nll_hist-{timestamp}.csv"
     with open(csv_filename, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(["bin_start", "bin_end", "count"])

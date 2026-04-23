@@ -84,12 +84,40 @@ def opt_sequential(model, dataloader, dev):
 
     print('Ready.')
 
+    import os
+
+    # --- Resume: load any already-pruned layer checkpoints ---
+    resume_from = -1
+    if args.checkpoint_dir:
+        for i in range(len(layers)):
+            ckpt_path = os.path.join(args.checkpoint_dir, f'layer_{i}.pt')
+            if os.path.exists(ckpt_path):
+                layers[i].load_state_dict(torch.load(ckpt_path, map_location='cpu'))
+                resume_from = i
+                print(f"Loaded checkpoint for layer {i}")
+            else:
+                break
+
+    # Reconstruct inps by running forward through already-pruned layers
+    if resume_from >= 0:
+        print(f"Resuming from layer {resume_from + 1}, replaying forward passes...")
+        for i in range(resume_from + 1):
+            layer = layers[i].to(dev)
+            for j in range(args.nsamples):
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            layers[i] = layer.cpu()
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+            else:
+                torch.cuda.empty_cache()
+            inps, outs = outs, inps
+
     print("Total Layers:", len(layers))
-    for i in range(len(layers)):
+    for i in range(resume_from + 1, len(layers)):
         layer = layers[i].to(dev)
 
         subset = find_layers(layer)
-        
+
         gpts = {}
         for name in subset:
             if (not (args.minlayer <= i < args.maxlayer and args.prune_only in name)) == (not args.invert):
@@ -109,7 +137,6 @@ def opt_sequential(model, dataloader, dev):
         for name in gpts:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
         for j in range(args.nsamples):
-            print(f"inps dim: {inps[j].shape}, attention dim: {attention_mask.shape}")
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
         for h in handles:
             h.remove()
@@ -127,6 +154,13 @@ def opt_sequential(model, dataloader, dev):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
 
         layers[i] = layer.cpu()
+
+        # --- Save checkpoint for this layer ---
+        if args.checkpoint_dir:
+            os.makedirs(args.checkpoint_dir, exist_ok=True)
+            torch.save(layers[i].state_dict(), os.path.join(args.checkpoint_dir, f'layer_{i}.pt'))
+            print(f"Saved checkpoint for layer {i}")
+
         del layer
         if torch.backends.mps.is_available():
             torch.mps.empty_cache()
@@ -395,7 +429,7 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
     now = datetime.now()
     timestamp = now.strftime("%Y%m%d_%H%M%S")
 
-    csv_filename = f"{dataset}_optmes_token_nll_hist-{timestamp}.csv"
+    csv_filename = f"data/{dataset}_optmes_token_nll_hist-{timestamp}.csv"
     with open(csv_filename, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(["bin_start", "bin_end", "count"])
@@ -481,6 +515,14 @@ if __name__ == '__main__':
        '--log_wandb', action='store_true',
        help='Whether to log to wandb.'
     )
+    parser.add_argument(
+       '--checkpoint_dir', type=str, default='',
+       help='Directory to save/load per-layer pruning checkpoints. Enables resume.'
+    )
+    parser.add_argument(
+       '--load_pruned', type=str, default='',
+       help='Path to a previously saved pruned model (from --save). Skips pruning and goes straight to eval.'
+    )
 
     args = parser.parse_args()
 
@@ -489,14 +531,20 @@ if __name__ == '__main__':
         assert has_wandb, "wandb not installed try `pip install wandb`"
         wandb.init(config=args)
 
-    model = get_opt(args.model)
+    if args.load_pruned:
+        from transformers import OPTForCausalLM
+        print(f"Loading precomputed pruned model from {args.load_pruned}")
+        model = OPTForCausalLM.from_pretrained(args.load_pruned, torch_dtype=torch.float32)
+        model.seqlen = model.config.max_position_embeddings
+    else:
+        model = get_opt(args.model)
     model.eval()
 
     dataloader, testloader = get_loaders(
         args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen
     )
 
-    if (args.sparsity or args.prunen) and not args.gmp:
+    if not args.load_pruned and (args.sparsity or args.prunen) and not args.gmp:
         tick = time.time()
         opt_sequential(model, dataloader, DEV)
         for n, p in model.named_parameters():
